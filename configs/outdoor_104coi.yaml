@@ -1,0 +1,53 @@
+﻿# Configuration for Outdoor 104-CoI YOLIC (Edge / E-Scooter Vision)
+dataset:
+  name: "outdoor_104coi"
+  image_size: [224, 224]
+  num_cois: 104
+  top_sign_cois: 8
+  road_cois: 96
+  near_field_indices: [0, 20]  # CoI indices 0 to 20 inclusive trigger emergency stop
+  num_classes: 11
+  class_names:
+    - "Pothole"
+    - "Speed Bump"
+    - "Manhole Cover"
+    - "Pedestrian"
+    - "Bicycle"
+    - "Car"
+    - "Debris"
+    - "Curb"
+    - "Stop Sign"
+    - "Yield Sign"
+    - "Warning Sign"
+  background_class: "Clear Road"
+  background_index: 11
+
+model:
+  backbone_type: "shufflenet_v2"
+  num_cois: 104
+  num_classes: 11
+  cell_dim: 128
+  attention_heads: 4
+  attention_dropout: 0.1
+  use_context_module: true
+  use_grouped_head: true
+
+training:
+  epochs: 150
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  lr_milestones: [100, 125]
+  lr_gamma: 0.1
+  threshold: 0.5
+  save_dir: "checkpoints/outdoor_104coi"
+
+inference:
+  temporal_alpha: 0.8
+  detection_threshold: 0.5
+
+iot:
+  node_id: "scooter_27"
+  mqtt_broker: "localhost"
+  mqtt_port: 1883
+  mqtt_topic: "iot/scooter/telemetry"

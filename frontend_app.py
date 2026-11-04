@@ -1,8 +1,8 @@
 """
-YOLIC Paper-Style Interactive Visualizer (Streamlit - Autonomous Vehicle HUD Edition)
+YOLIC Paper-Style Interactive Visualizer (Streamlit - High-Definition Autonomous Vehicle HUD)
 Replicates the 104-CoI grid overlays from Su et al. (Image and Vision Computing 2024, Fig. 1 & Fig. 8)
-with authentic real-time Autonomous Driving Heads-Up Display (HUD) overlays:
-- Live `● REC` timestamp counter & Camera Telemetry.
+with razor-sharp 640x640 Autonomous Driving Heads-Up Display (HUD) overlays:
+- Crisp `● REC` live timecode counter & Edge AI Telemetry.
 - Dynamic vehicle trajectory lines and perspective corridor.
 - Distance-aware hazard badges (<1.8m Danger vs. >5m Warning).
 - Real-time speedometer gauge with emergency brake strobe.
@@ -85,28 +85,32 @@ def draw_yolic_hud_grid(
     show_road_grid: bool = True,
     fps: float = 31.4,
     latency_ms: float = 31.8,
-    frame_idx: int = 1
+    frame_idx: int = 1,
+    render_dim: int = 640
 ) -> Tuple[np.ndarray, List[dict], dict]:
     """
-    Renders paper-matching perspective cell grid and authentic Autonomous Vehicle HUD telemetry.
+    Renders paper-matching perspective cell grid and razor-sharp Autonomous Vehicle HUD telemetry.
+    Upscales to render_dim (640x640) so graphics, borders, and text are crisp and unpixelated.
     """
-    H, W, _ = image_bgr.shape
+    # 1. Upscale image to high resolution for sharp HUD rendering
+    hires_img = cv2.resize(image_bgr, (render_dim, render_dim), interpolation=cv2.INTER_LINEAR)
+    H, W = render_dim, render_dim
     polygons = get_coi_polygons(num_cois)
 
-    overlay = image_bgr.copy()
+    overlay = hires_img.copy()
     active_hazards = []
 
     bg_probs = probabilities[:, 11]
     hazard_probs = probabilities[:, :11]
 
-    # 1. Perspective Trajectory Guide (Vehicle Driving Corridor)
+    # 2. Perspective Trajectory Guide (Vehicle Driving Corridor)
     pts_corridor = np.array([
-        [int(0.24 * W), H],
-        [int(0.76 * W), H],
-        [int(0.56 * W), int(0.38 * H)],
-        [int(0.44 * W), int(0.38 * H)]
+        [int(0.25 * W), H],
+        [int(0.75 * W), H],
+        [int(0.55 * W), int(0.38 * H)],
+        [int(0.45 * W), int(0.38 * H)]
     ], dtype=np.int32)
-    cv2.polylines(overlay, [pts_corridor], isClosed=False, color=(255, 230, 50), thickness=1)
+    cv2.polylines(overlay, [pts_corridor], isClosed=False, color=(255, 230, 80), thickness=2, lineType=cv2.LINE_AA)
 
     for idx, poly_norm in enumerate(polygons):
         poly_px = (poly_norm * [W, H]).astype(np.int32)
@@ -117,7 +121,6 @@ def draw_yolic_hud_grid(
         best_cls = int(np.argmax(hazard_probs[idx]))
         p_hazard = float(hazard_probs[idx, best_cls])
 
-        # Active hazard condition (Paper: P_bg < 0.5 and P_hazard >= threshold)
         is_hazard = (p_bg < threshold) and (p_hazard >= threshold)
 
         if is_hazard:
@@ -128,9 +131,8 @@ def draw_yolic_hud_grid(
             # Colored semi-transparent highlight fill
             cv2.fillPoly(overlay, [poly_px], color_bgr)
             # Solid bright border
-            cv2.polylines(overlay, [poly_px], isClosed=True, color=(255, 255, 255), thickness=2)
+            cv2.polylines(overlay, [poly_px], isClosed=True, color=(255, 255, 255), thickness=2, lineType=cv2.LINE_AA)
 
-            # Distance estimation based on row
             row_idx = idx // 8 if idx < 96 else 99
             if is_near_field:
                 dist_str = "< 1.8m [DANGER]"
@@ -138,14 +140,17 @@ def draw_yolic_hud_grid(
                 dist_est = 2.0 + (row_idx * 0.9)
                 dist_str = f"~{dist_est:.1f}m"
 
-            # Badge Label
+            # Crisp Badge Label inside or above cell
             label = f"{cls_name} {int(p_hazard*100)}%"
+            # Badge background capsule
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+            cv2.rectangle(overlay, (cx - tw // 2 - 4, cy - th - 4), (cx + tw // 2 + 4, cy + 4), (20, 20, 25), -1)
             cv2.putText(
                 overlay,
                 label,
-                (max(3, cx - 35), max(12, cy - 2)),
+                (cx - tw // 2, cy),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.32,
+                0.42,
                 (255, 255, 255),
                 1,
                 cv2.LINE_AA
@@ -161,52 +166,58 @@ def draw_yolic_hud_grid(
 
         elif show_road_grid:
             # Clear road cell: subtle green perspective outline
-            cv2.polylines(overlay, [poly_px], isClosed=True, color=(0, 220, 0), thickness=1)
+            cv2.polylines(overlay, [poly_px], isClosed=True, color=(0, 225, 0), thickness=1, lineType=cv2.LINE_AA)
 
     # Alpha blend overlay with base image
-    blended = cv2.addWeighted(overlay, 0.50, image_bgr, 0.50, 0)
+    blended = cv2.addWeighted(overlay, 0.55, hires_img, 0.45, 0)
 
     # Crisp borders on active hazard cells
     for h in active_hazards:
         poly_px = (polygons[h["coi_id"]] * [W, H]).astype(np.int32)
         color_bgr = CLASS_COLORS.get(CLASS_NAMES.index(h["class"]), (0, 0, 255))
-        cv2.polylines(blended, [poly_px], isClosed=True, color=color_bgr, thickness=2)
+        cv2.polylines(blended, [poly_px], isClosed=True, color=color_bgr, thickness=2, lineType=cv2.LINE_AA)
 
-    # 2. Authentic Autonomous Vehicle HUD Stamping (Directly on frame)
-    # HUD Top Bar Background Strip
-    cv2.rectangle(blended, (0, 0), (W, 20), (15, 15, 18), -1)
-    cv2.line(blended, (0, 20), (W, 20), (50, 200, 50), 1)
+    # 3. Autonomous Vehicle HUD Top & Bottom Bars
+    # Top Bar (Dark semi-transparent header)
+    top_bar_h = 32
+    cv2.rectangle(blended, (0, 0), (W, top_bar_h), (18, 20, 24), -1)
+    cv2.line(blended, (0, top_bar_h), (W, top_bar_h), (60, 220, 100), 2)
 
-    # REC Strobe Indicator
-    cv2.circle(blended, (8, 10), 4, (0, 0, 255), -1)
+    # Left: REC Indicator & Timecode
+    cv2.circle(blended, (18, 16), 6, (0, 0, 255), -1)
     now_time = datetime.datetime.now().strftime("%H:%M:%S")
-    time_str = f"REC {now_time}.{(frame_idx % 30):02d}"
-    cv2.putText(blended, time_str, (16, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (240, 240, 240), 1, cv2.LINE_AA)
+    time_str = f"REC  {now_time}.{(frame_idx % 30):02d}  |  CAM: SCOOTER_FRONT_01"
+    cv2.putText(blended, time_str, (32, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 245, 250), 1, cv2.LINE_AA)
 
-    # Edge CPU Telemetry
-    cpu_info = f"1-CORE CPU | {latency_ms:.1f}ms | {fps:.1f} FPS"
-    cv2.putText(blended, cpu_info, (W - 145, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (0, 255, 220), 1, cv2.LINE_AA)
+    # Right: Edge CPU Telemetry
+    cpu_info = f"EDGE AI: 1-CORE CPU | {latency_ms:.1f}ms ({fps:.1f} FPS)"
+    (cw, ch), _ = cv2.getTextSize(cpu_info, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    cv2.putText(blended, cpu_info, (W - cw - 16, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 220), 1, cv2.LINE_AA)
 
-    # HUD Bottom Bar Background Strip
-    cv2.rectangle(blended, (0, H - 22), (W, H), (15, 15, 18), -1)
-    cv2.line(blended, (0, H - 22), (W, H - 22), (50, 200, 50), 1)
+    # Bottom Bar (Dark footer)
+    bot_bar_h = 34
+    cv2.rectangle(blended, (0, H - bot_bar_h), (W, H), (18, 20, 24), -1)
+    cv2.line(blended, (0, H - bot_bar_h), (W, H - bot_bar_h), (60, 220, 100), 2)
 
     # Actuator Signal Status
     has_near_hazard = any(h["is_near_field"] for h in active_hazards)
     has_hazards = len(active_hazards) > 0
 
     if has_near_hazard:
-        status_txt = "BRAKE: 🛑 EMERGENCY STOP (0 km/h)"
-        cv2.putText(blended, status_txt, (8, H - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (50, 50, 255), 1, cv2.LINE_AA)
+        status_txt = "ACTUATOR: [EMERGENCY BRAKE ENGAGED] (0 km/h)"
+        status_color = (40, 40, 255) # Red
     elif has_hazards:
-        status_txt = "SPEED: ⚠️ WARNING THROTTLE (10 km/h)"
-        cv2.putText(blended, status_txt, (8, H - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0, 220, 255), 1, cv2.LINE_AA)
+        status_txt = "ACTUATOR: [SPEED WARNING REDUCTION] (10 km/h)"
+        status_color = (0, 220, 255) # Yellow
     else:
-        status_txt = "STATUS: ✅ CLEAR CRUISING (25 km/h)"
-        cv2.putText(blended, status_txt, (8, H - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (50, 255, 50), 1, cv2.LINE_AA)
+        status_txt = "ACTUATOR: [ALL CLEAR CRUISING] (25 km/h)"
+        status_color = (50, 255, 60) # Green
 
-    coi_badge = f"COIs: {num_cois} | HAZARDS: {len(active_hazards)}"
-    cv2.putText(blended, coi_badge, (W - 130, H - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(blended, status_txt, (18, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.48, status_color, 1, cv2.LINE_AA)
+
+    coi_badge = f"{num_cois} CoIs | ACTIVE HAZARDS: {len(active_hazards)}"
+    (bw, bh), _ = cv2.getTextSize(coi_badge, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    cv2.putText(blended, coi_badge, (W - bw - 16, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
 
     actuator_decision = {
         "emergency_stop": has_near_hazard,
@@ -307,7 +318,7 @@ def main():
         latency_ms = (t1 - t0) * 1000.0
         fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
 
-        # Render Authentic HUD
+        # Render Authentic HD HUD
         rendered_bgr, active_hazards, actuation_dec = draw_yolic_hud_grid(
             img_bgr,
             probs,
@@ -325,8 +336,7 @@ def main():
         col_img, col_metrics = st.columns([3, 2])
 
         with col_img:
-            display_img = cv2.resize(rendered_rgb, (640, 640), interpolation=cv2.INTER_NEAREST)
-            st.image(display_img, caption="Live YOLIC Edge Vision Camera HUD Overlay", use_container_width=True)
+            st.image(rendered_rgb, caption="Live YOLIC Edge Vision Camera HUD Overlay (640x640 HD)", use_container_width=True)
 
         with col_metrics:
             # Actuator Status Banner
@@ -340,7 +350,7 @@ def main():
             # Metrics Card
             m_col1, m_col2, m_col3 = st.columns(3)
             m_col1.metric("Latency", f"{latency_ms:.1f} ms")
-            m_col2.metric("FPS", f"{fps:.1f}")
+            m_col2.metric("Throughput", f"{fps:.1f} FPS")
             m_col3.metric("Target Speed", f"{actuation['target_speed_kmh']} km/h")
 
             # Active Hazards Table
@@ -395,8 +405,7 @@ def main():
                 rendered_rgb = cv2.cvtColor(rendered_bgr, cv2.COLOR_BGR2RGB)
                 actuation = actuator.evaluate(active_hazards)
 
-                display_img = cv2.resize(rendered_rgb, (640, 640), interpolation=cv2.INTER_NEAREST)
-                frame_slot.image(display_img, caption=f"Live Camera Stream [Frame {idx+1}/{stream_len}] | Latency: {latency_ms:.1f}ms ({fps:.1f} FPS)")
+                frame_slot.image(rendered_rgb, caption=f"Live Camera Stream [Frame {idx+1}/{stream_len}] | Latency: {latency_ms:.1f}ms ({fps:.1f} FPS)")
 
                 if actuation["emergency_stop"]:
                     actuator_slot.error(f"🛑 Frame {idx+1}: {actuation['status_message']}")
@@ -441,7 +450,7 @@ def main():
 
             c1, c2 = st.columns([3, 2])
             with c1:
-                st.image(cv2.resize(rendered_rgb, (640, 640)), caption="Live HUD Overlays", use_container_width=True)
+                st.image(rendered_rgb, caption="Live HD HUD Overlays", use_container_width=True)
             with c2:
                 if actuation["emergency_stop"]:
                     st.error(f"🛑 {actuation['status_message']}")

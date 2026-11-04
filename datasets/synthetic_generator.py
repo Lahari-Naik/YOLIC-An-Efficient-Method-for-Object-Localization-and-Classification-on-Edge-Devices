@@ -128,9 +128,8 @@ class SyntheticSceneGenerator:
     Renders photorealistic synthetic road imagery and corresponding ground-truth CoI target matrices.
     """
     CLASS_NAMES = [
-        "Pothole", "Speed Bump", "Manhole Cover", "Pedestrian",
-        "Bicycle", "Car", "Debris", "Curb", "Stop Sign",
-        "Yield Sign", "Warning Sign"
+        "Bump", "Column", "Dent", "Fence", "Creature",
+        "Vehicle", "Wall", "Weed", "ZebraCrossing", "TrafficCone", "TrafficSign"
     ]
     BACKGROUND_NAME = "Clear Road"
 

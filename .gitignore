@@ -1,4 +1,4 @@
-﻿# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,6 +8,8 @@ checkpoints/**/*.pth
 checkpoints/**/*.pt
 *.pth
 *.pt
+weights/*.onnx
+weights/*.tar
 
 # Virtual environments
 .venv/

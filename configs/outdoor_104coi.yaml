@@ -1,4 +1,4 @@
-﻿# Configuration for Outdoor 104-CoI YOLIC (Edge / E-Scooter Vision)
+# Configuration for Outdoor 104-CoI YOLIC (Edge / E-Scooter Vision)
 dataset:
   name: "outdoor_104coi"
   image_size: [224, 224]
@@ -8,17 +8,17 @@ dataset:
   near_field_indices: [0, 20]  # CoI indices 0 to 20 inclusive trigger emergency stop
   num_classes: 11
   class_names:
-    - "Pothole"
-    - "Speed Bump"
-    - "Manhole Cover"
-    - "Pedestrian"
-    - "Bicycle"
-    - "Car"
-    - "Debris"
-    - "Curb"
-    - "Stop Sign"
-    - "Yield Sign"
-    - "Warning Sign"
+    - "Bump"
+    - "Column"
+    - "Dent"
+    - "Fence"
+    - "Creature"
+    - "Vehicle"
+    - "Wall"
+    - "Weed"
+    - "ZebraCrossing"
+    - "TrafficCone"
+    - "TrafficSign"
   background_class: "Clear Road"
   background_index: 11
 

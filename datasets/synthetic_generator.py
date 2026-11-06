@@ -247,76 +247,109 @@ class SyntheticSceneGenerator:
         return img, target, hazard_list
 
     def _render_bold_hazard(self, img: np.ndarray, cls_id: int, cx: int, cy: int, bw: int, bh: int):
-        """Draws bold, unmistakable, high-contrast visual hazard objects."""
-        # Scale up the obstacle size so it is clearly visible to the human eye
-        w_size = max(12, bw // 2)
-        h_size = max(8, bh // 2)
+        """Draws bold, unmistakable, high-contrast visual hazard objects matching the 11 paper classes."""
+        w_size = max(14, bw // 2)
+        h_size = max(10, bh // 2)
 
-        if cls_id == 0:  # Pothole: Deep, jagged black asphalt crater with high-contrast depth rim
+        if cls_id == 0:  # Bump: Speed Bump (yellow & black diagonal hazard stripes)
+            pts_bump = np.array([
+                [cx - w_size - 4, cy + h_size // 2], [cx + w_size + 4, cy + h_size // 2],
+                [cx + w_size, cy - h_size // 2], [cx - w_size, cy - h_size // 2]
+            ], dtype=np.int32)
+            cv2.fillPoly(img, [pts_bump], (20, 230, 255))
+            for s in range(-w_size, w_size + 1, 6):
+                cv2.line(img, (cx + s, cy + h_size // 2), (cx + s + 3, cy - h_size // 2), (15, 15, 20), 2)
+            cv2.polylines(img, [pts_bump], True, (0, 0, 0), 1)
+
+        elif cls_id == 1:  # Column: Vertical pole / lamppost / pillar
+            col_w = max(4, w_size // 3)
+            col_h = max(24, h_size * 2)
+            cv2.rectangle(img, (cx - col_w, cy - col_h), (cx + col_w, cy + h_size // 2), (160, 165, 170), -1)
+            cv2.rectangle(img, (cx - col_w, cy - col_h), (cx + col_w, cy + h_size // 2), (60, 60, 65), 1)
+            cv2.circle(img, (cx, cy - col_h), col_w + 2, (220, 220, 230), -1)
+
+        elif cls_id == 2:  # Dent: Pothole / road asphalt crater
             cv2.ellipse(img, (cx, cy), (w_size, max(4, h_size // 2)), 0, 0, 360, (15, 15, 18), -1)
             cv2.ellipse(img, (cx, cy), (w_size, max(4, h_size // 2)), 0, 0, 360, (180, 180, 190), 2)
             cv2.line(img, (cx - w_size, cy), (cx - w_size - 4, cy - 2), (200, 200, 210), 1)
             cv2.line(img, (cx + w_size, cy), (cx + w_size + 4, cy + 2), (200, 200, 210), 1)
 
-        elif cls_id == 1:  # Speed Bump: Bold bright yellow/black striped hump across lane
-            pts_bump = np.array([
-                [cx - w_size - 4, cy + h_size // 2], [cx + w_size + 4, cy + h_size // 2],
-                [cx + w_size, cy - h_size // 2], [cx - w_size, cy - h_size // 2]
-            ], dtype=np.int32)
-            cv2.fillPoly(img, [pts_bump], (20, 230, 255)) # Reflective caution yellow
-            # Black diagonal caution stripes
-            for s in range(-w_size, w_size + 1, 6):
-                cv2.line(img, (cx + s, cy + h_size // 2), (cx + s + 3, cy - h_size // 2), (15, 15, 20), 2)
-            cv2.polylines(img, [pts_bump], True, (0, 0, 0), 1)
+        elif cls_id == 3:  # Fence: Railing / barrier pickets
+            fence_w = max(18, w_size * 2)
+            fence_h = max(12, h_size)
+            # Horizontal rails
+            cv2.line(img, (cx - fence_w // 2, cy - fence_h // 2), (cx + fence_w // 2, cy - fence_h // 2), (80, 140, 180), 2)
+            cv2.line(img, (cx - fence_w // 2, cy + fence_h // 2), (cx + fence_w // 2, cy + fence_h // 2), (80, 140, 180), 2)
+            # Vertical pickets
+            for px in range(cx - fence_w // 2, cx + fence_w // 2 + 1, 6):
+                cv2.line(img, (px, cy - fence_h // 2 - 3), (px, cy + fence_h // 2 + 4), (90, 150, 190), 2)
 
-        elif cls_id == 2:  # Manhole Cover: Metallic circle with cross-grip
-            cv2.circle(img, (cx, cy), max(6, w_size // 2), (90, 95, 100), -1)
-            cv2.circle(img, (cx, cy), max(6, w_size // 2), (200, 200, 200), 2)
-            cv2.line(img, (cx - w_size // 3, cy), (cx + w_size // 3, cy), (40, 40, 45), 2)
-            cv2.line(img, (cx, cy - w_size // 3), (cx, cy + w_size // 3), (40, 40, 45), 2)
-
-        elif cls_id == 3:  # Pedestrian: High-vis orange safety jacket, head, walking legs
-            head_r = max(3, h_size // 3)
-            # Head
-            cv2.circle(img, (cx, cy - h_size - head_r), head_r, (230, 190, 160), -1)
-            # Torso (Bright orange high-vis jacket)
+        elif cls_id == 4:  # Creature: Person / Pedestrian (Head, torso, legs / upper body)
+            head_r = max(4, h_size // 3)
+            # Head with hair/skin tone
+            cv2.circle(img, (cx, cy - h_size - head_r), head_r, (215, 185, 160), -1)
+            cv2.circle(img, (cx, cy - h_size - head_r), head_r, (60, 40, 30), 1)
+            # Torso / Jacket (High-contrast clothing)
             cv2.rectangle(img, (cx - head_r - 2, cy - h_size), (cx + head_r + 2, cy), (0, 140, 255), -1)
-            # Reflective safety stripe on chest
             cv2.line(img, (cx - head_r - 2, cy - h_size // 2), (cx + head_r + 2, cy - h_size // 2), (255, 255, 255), 1)
-            # Dark walking pants/legs
+            # Walking legs / lower body
             cv2.line(img, (cx - 2, cy), (cx - 4, cy + h_size), (40, 40, 50), 3)
             cv2.line(img, (cx + 2, cy), (cx + 5, cy + h_size), (40, 40, 50), 3)
 
-        elif cls_id == 4:  # Bicycle: Two wheels + red frame
-            w_r = max(4, w_size // 3)
-            cv2.circle(img, (cx - w_r - 3, cy), w_r, (30, 30, 30), 2)
-            cv2.circle(img, (cx + w_r + 3, cy), w_r, (30, 30, 30), 2)
-            cv2.line(img, (cx - w_r - 3, cy), (cx, cy - w_r), (0, 0, 230), 2)
-            cv2.line(img, (cx + w_r + 3, cy), (cx, cy - w_r), (0, 0, 230), 2)
-
-        elif cls_id == 5:  # Car: Red sedan rear with bright red taillights & license plate
-            car_w = max(14, w_size)
-            car_h = max(8, h_size)
-            # Car body
-            cv2.rectangle(img, (cx - car_w, cy - car_h), (cx + car_w, cy + car_h), (180, 25, 25), -1)
-            # Roof / Rear window
+        elif cls_id == 5:  # Vehicle: Car / van rear with windshield & taillights
+            car_w = max(16, w_size)
+            car_h = max(10, h_size)
+            cv2.rectangle(img, (cx - car_w, cy - car_h), (cx + car_w, cy + car_h), (180, 30, 30), -1)
             cv2.rectangle(img, (cx - car_w + 3, cy - car_h + 1), (cx + car_w - 3, cy - 1), (30, 50, 70), -1)
-            # Bright red glowing taillights
             cv2.circle(img, (cx - car_w + 4, cy + car_h - 3), 3, (0, 0, 255), -1)
             cv2.circle(img, (cx + car_w - 4, cy + car_h - 3), 3, (0, 0, 255), -1)
-            # White license plate
             cv2.rectangle(img, (cx - 4, cy + car_h - 4), (cx + 4, cy + car_h - 1), (255, 255, 255), -1)
 
-        elif cls_id == 6:  # Debris: Broken cinder blocks / rocks
-            for dx, dy in [(-6, 0), (4, -2), (0, 4), (-3, 3)]:
-                cv2.rectangle(img, (cx + dx - 2, cy + dy - 2), (cx + dx + 2, cy + dy + 2), (110, 100, 90), -1)
+        elif cls_id == 6:  # Wall: Concrete barrier / brick wall segment
+            wall_w = max(20, w_size * 2)
+            wall_h = max(14, h_size)
+            cv2.rectangle(img, (cx - wall_w // 2, cy - wall_h // 2), (cx + wall_w // 2, cy + wall_h // 2), (130, 120, 110), -1)
+            cv2.rectangle(img, (cx - wall_w // 2, cy - wall_h // 2), (cx + wall_w // 2, cy + wall_h // 2), (60, 55, 50), 1)
+            for brick_y in range(cy - wall_h // 2 + 4, cy + wall_h // 2, 4):
+                cv2.line(img, (cx - wall_w // 2, brick_y), (cx + wall_w // 2, brick_y), (170, 160, 150), 1)
 
-        elif cls_id == 7:  # Curb: Raised concrete barrier
-            cv2.line(img, (cx - w_size, cy), (cx + w_size, cy), (240, 240, 245), 4)
+        elif cls_id == 7:  # Weed: Roadside vegetation / green shrub / leaves
+            for angle in [0, 45, 90, 135, 180]:
+                rad = math.radians(angle)
+                lx = int(cx + w_size * 0.6 * math.cos(rad))
+                ly = int(cy - h_size * 0.6 * math.sin(rad))
+                cv2.ellipse(img, (lx, ly), (w_size // 3, h_size // 2), angle, 0, 360, (25, 140, 40), -1)
+            cv2.circle(img, (cx, cy), max(3, w_size // 4), (15, 110, 30), -1)
 
-        elif cls_id == 8:  # Stop Sign (Octagonal red sign on pole)
-            cv2.line(img, (cx, cy + h_size), (cx, cy + h_size + 14), (140, 140, 145), 2)
-            r_sign = max(6, w_size // 2)
+        elif cls_id == 8:  # ZebraCrossing: White crosswalk stripes
+            stripe_w = max(6, w_size // 2)
+            stripe_h = max(12, h_size)
+            for dx in [-stripe_w * 2, 0, stripe_w * 2]:
+                pts = np.array([
+                    [cx + dx - stripe_w // 2, cy - stripe_h // 2],
+                    [cx + dx + stripe_w // 2, cy - stripe_h // 2],
+                    [cx + dx + stripe_w // 2, cy + stripe_h // 2],
+                    [cx + dx - stripe_w // 2, cy + stripe_h // 2]
+                ], dtype=np.int32)
+                cv2.fillPoly(img, [pts], (245, 245, 245))
+
+        elif cls_id == 9:  # TrafficCone: Bright orange cone with white reflective band
+            cone_w = max(8, w_size // 2)
+            cone_h = max(16, h_size * 2)
+            pts_cone = np.array([
+                [cx - cone_w, cy + cone_h // 2],
+                [cx + cone_w, cy + cone_h // 2],
+                [cx, cy - cone_h // 2]
+            ], dtype=np.int32)
+            cv2.fillPoly(img, [pts_cone], (0, 120, 255))
+            # White reflective band across middle
+            cv2.line(img, (cx - cone_w // 2, cy), (cx + cone_w // 2, cy), (255, 255, 255), max(2, cone_h // 6))
+            # Base plate
+            cv2.rectangle(img, (cx - cone_w - 2, cy + cone_h // 2 - 2), (cx + cone_w + 2, cy + cone_h // 2 + 2), (0, 90, 210), -1)
+
+        elif cls_id == 10:  # TrafficSign: Octagonal stop or warning sign on post
+            cv2.line(img, (cx, cy + h_size), (cx, cy + h_size + 16), (140, 140, 145), 2)
+            r_sign = max(7, w_size // 2)
             pts = np.array([
                 [cx - r_sign, cy - r_sign // 2], [cx - r_sign // 2, cy - r_sign],
                 [cx + r_sign // 2, cy - r_sign], [cx + r_sign, cy - r_sign // 2],
@@ -325,13 +358,6 @@ class SyntheticSceneGenerator:
             ], dtype=np.int32)
             cv2.fillPoly(img, [pts], (230, 20, 20))
             cv2.polylines(img, [pts], True, (255, 255, 255), 1)
-
-        elif cls_id in (9, 10):  # Warning / Yield Sign
-            cv2.line(img, (cx, cy + h_size), (cx, cy + h_size + 12), (140, 140, 145), 2)
-            r_sign = max(6, w_size // 2)
-            pts = np.array([[cx - r_sign, cy - r_sign], [cx + r_sign, cy - r_sign], [cx, cy + r_sign]], dtype=np.int32)
-            cv2.fillPoly(img, [pts], (20, 220, 250))
-            cv2.polylines(img, [pts], True, (20, 20, 20), 2)
 
     def get_preset_scenario(self, scenario_name: str) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
         """
@@ -342,20 +368,20 @@ class SyntheticSceneGenerator:
             # 100% clean road: 0 hazards!
             forced = []
         elif scenario_name == "Emergency Stop: Pedestrian Ahead (< 2m)":
-            # CoI 11 (row 1, center-left, right in front of scooter): Pedestrian (3)
-            forced = [(11, 3)]
+            # CoI 11 (row 1, center-left, right in front of scooter): Creature / Pedestrian (4)
+            forced = [(11, 4)]
         elif scenario_name == "Emergency Stop: Deep Pothole in Near-Lane":
-            # CoI 12 (row 1, center-right): Pothole (0)
-            forced = [(12, 0)]
+            # CoI 12 (row 1, center-right): Dent / Pothole (2)
+            forced = [(12, 2)]
         elif scenario_name == "Speed Warning: Speed Bump Ahead (~5m)":
-            # CoI 35 (row 4, mid-lane): Speed Bump (1)
-            forced = [(35, 1)]
+            # CoI 35 (row 4, mid-lane): Bump / Speed Bump (0)
+            forced = [(35, 0)]
         elif scenario_name == "Speed Warning: Car Ahead in Mid-Distance":
-            # CoI 43 (row 5, center lane): Car (5)
+            # CoI 43 (row 5, center lane): Vehicle (5)
             forced = [(43, 5)]
         elif scenario_name == "Intersection: Overhead Stop Sign":
-            # CoI 99 (top sign band): Stop Sign (8)
-            forced = [(99, 8)]
+            # CoI 99 (top sign band): TrafficSign (10)
+            forced = [(99, 10)]
         else:
             forced = []
 

@@ -1,17 +1,20 @@
 """
 Ultra-Lightweight Raspberry Pi Edge Server for YOLIC
-Runs inference locally on Raspberry Pi CPU and streams live annotated HUD video + telemetry
-to any laptop browser over Wi-Fi / LAN with zero client setup.
+Runs inference locally on Raspberry Pi CPU.
+Supports BOTH:
+1. Laptop's Webcam (streams frames from laptop browser to Pi for edge inference)
+2. Pi's Own Camera (CSI Camera Module or USB webcam on Pi)
 """
 
 import os
 import sys
 import time
 import json
+import base64
 import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread, Lock
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple, Any
 
 import cv2
 import numpy as np
@@ -47,7 +50,12 @@ CLASS_COLORS = {
     11: (0, 255, 0)      # Background / Clear (Green)
 }
 
-# Global frame buffer for streaming
+# Global Pipeline State
+global_model = None
+global_smoother = None
+global_polygons = None
+global_transform = None
+
 latest_jpeg = None
 latest_telemetry = {
     "fps": 0.0,
@@ -71,13 +79,45 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def init_yolic_pipeline():
+    """Initializes the YOLIC model and transforms once at startup."""
+    global global_model, global_smoother, global_polygons, global_transform
+
+    torch.set_num_threads(2)
+    global_model = UnifiedYOLIC(
+        num_cois=104,
+        num_classes=11,
+        backbone_type="shufflenet_v2",
+        cell_dim=128,
+        attention_heads=4,
+        use_context_module=True,
+        use_grouped_head=True,
+        pretrained_backbone=False
+    )
+    ckpt_path = os.path.join(PROJECT_ROOT, "checkpoints", "outdoor_104coi", "best_model.pth")
+    if os.path.exists(ckpt_path):
+        global_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        print(f"Loaded calibrated Edge TinyML checkpoint from {ckpt_path}")
+    global_model.eval()
+
+    global_smoother = TemporalSmoother(alpha=0.8)
+    global_polygons = get_coi_polygons(104)
+
+    global_transform = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+
 def render_yolic_hud(
     image_bgr: np.ndarray,
     probs: np.ndarray,
     polygons: List[np.ndarray],
     threshold: float = 0.50,
     fps: float = 30.0,
-    latency_ms: float = 32.0
+    latency_ms: float = 32.0,
+    device_label: str = "PI-EDGE TINYML"
 ) -> Tuple[np.ndarray, List[Dict], Dict]:
     """Renders paper-matching 104-CoI perspective grid HUD with closed-loop actuation."""
     H, W = 480, 640
@@ -106,7 +146,7 @@ def render_yolic_hud(
         best_cls = int(np.argmax(haz_probs[idx]))
         p_haz = float(haz_probs[idx, best_cls])
 
-        # Anti-hallucination verification
+        # Strict Anti-Hallucination Verification
         is_hazard = (p_bg < 0.50) and (p_haz >= threshold) and (p_haz > p_bg)
 
         if is_hazard:
@@ -142,7 +182,7 @@ def render_yolic_hud(
 
     # Top Status Bar
     cv2.rectangle(blended, (0, 0), (W, 24), (20, 20, 20), -1)
-    cv2.putText(blended, f"PI-EDGE TINYML | 104-COI | INFER: {latency_ms:.1f}ms ({fps:.1f} FPS)", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(blended, f"{device_label} | 104-COI | INFER: {latency_ms:.1f}ms ({fps:.1f} FPS)", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
 
     # Bottom Actuator Bar
     cv2.rectangle(blended, (0, H - 30), (W, H), (15, 15, 15), -1)
@@ -174,104 +214,112 @@ def render_yolic_hud(
     return blended, active_hazards, actuation
 
 
-def edge_inference_worker(camera_index: int = 0):
-    """Background worker continuously reading camera, running inference, and encoding MJPEG."""
+def process_single_frame(frame_bgr: np.ndarray, source_name: str = "LAPTOP CAM -> PI INFER") -> Tuple[bytes, Dict[str, Any]]:
+    """Runs full YOLIC TinyML pipeline on any frame and returns encoded JPEG + telemetry."""
+    global global_model, global_smoother, global_polygons, global_transform
+
+    t0 = time.perf_counter()
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    tensor = global_transform(T.functional.to_pil_image(rgb)).unsqueeze(0)
+
+    with torch.no_grad():
+        logits = global_model(tensor)
+        raw_out = logits.squeeze(0).numpy()
+        probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
+
+    probs = global_smoother.update(probs)
+    t1 = time.perf_counter()
+
+    latency_ms = (t1 - t0) * 1000.0
+    fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
+
+    rendered, active_hazards, actuation = render_yolic_hud(
+        frame_bgr,
+        probs,
+        global_polygons,
+        threshold=0.50,
+        fps=fps,
+        latency_ms=latency_ms,
+        device_label=source_name
+    )
+
+    _, jpeg_bytes = cv2.imencode(".jpg", rendered, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+
+    telemetry = {
+        "fps": round(fps, 1),
+        "latency_ms": round(latency_ms, 1),
+        "status": actuation["status_message"],
+        "target_speed": actuation["target_speed"],
+        "hazards_count": len(active_hazards),
+        "active_hazards": active_hazards
+    }
+
+    return jpeg_bytes.tobytes(), telemetry
+
+
+def pi_camera_worker(camera_index: int = 0):
+    """Background worker for when Pi has its own camera connected."""
     global latest_jpeg, latest_telemetry
 
-    print(f"Starting camera capture on device index {camera_index}...")
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print(f"Warning: Camera index {camera_index} could not be opened. Using test stream generator.")
-
-    # Load Model
-    torch.set_num_threads(2)
-    model = UnifiedYOLIC(
-        num_cois=104,
-        num_classes=11,
-        backbone_type="shufflenet_v2",
-        cell_dim=128,
-        attention_heads=4,
-        use_context_module=True,
-        use_grouped_head=True,
-        pretrained_backbone=False
-    )
-    ckpt_path = os.path.join(PROJECT_ROOT, "checkpoints", "outdoor_104coi", "best_model.pth")
-    if os.path.exists(ckpt_path):
-        model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-        print(f"Loaded calibrated Edge TinyML checkpoint from {ckpt_path}")
-    model.eval()
-
-    smoother = TemporalSmoother(alpha=0.8)
-    polygons = get_coi_polygons(104)
-
-    transform = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    sample_frame_idx = 0
-    test_files = []
-    real_dir = os.path.join(PROJECT_ROOT, "data", "real_author_dataset", "RGB")
-    if os.path.exists(real_dir):
-        test_files = [os.path.join(real_dir, f) for f in sorted(os.listdir(real_dir)) if f.endswith(".png")]
+        print(f"Pi Camera index {camera_index} not detected. Ready for Laptop Camera streaming!")
+        return
 
     while True:
-        t0 = time.perf_counter()
-        if cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.05)
-                continue
-        else:
-            # Fallback to cycling real author test frames if camera hardware is not plugged in
-            if test_files:
-                frame = cv2.imread(test_files[sample_frame_idx % len(test_files)])
-                sample_frame_idx += 1
-                time.sleep(0.04)
-            else:
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
 
-        # Preprocess and Infer
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        tensor = transform(T.functional.to_pil_image(rgb)).unsqueeze(0)
-
-        with torch.no_grad():
-            logits = model(tensor)
-            raw_out = logits.squeeze(0).numpy()
-            probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
-
-        probs = smoother.update(probs)
-        t1 = time.perf_counter()
-
-        latency_ms = (t1 - t0) * 1000.0
-        fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
-
-        rendered, active_hazards, actuation = render_yolic_hud(
-            frame,
-            probs,
-            polygons,
-            threshold=0.50,
-            fps=fps,
-            latency_ms=latency_ms
-        )
-
-        _, jpeg_bytes = cv2.imencode(".jpg", rendered, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-
+        jpeg_data, telemetry = process_single_frame(frame, source_name="PI CAMERA -> PI INFER")
         with frame_lock:
-            latest_jpeg = jpeg_bytes.tobytes()
-            latest_telemetry = {
-                "fps": round(fps, 1),
-                "latency_ms": round(latency_ms, 1),
-                "status": actuation["status_message"],
-                "target_speed": actuation["target_speed"],
-                "hazards_count": len(active_hazards),
-                "active_hazards": active_hazards
-            }
+            latest_jpeg = jpeg_data
+            latest_telemetry = telemetry
 
 
 class StreamingHandler(BaseHTTPRequestHandler):
-    """Serves the Web Dashboard and low-latency MJPEG video stream."""
+    """Serves the Web Dashboard, Laptop Camera receiver, and MJPEG video stream."""
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/api/infer_laptop_frame":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+
+            nparr = np.frombuffer(post_data, np.uint8)
+            frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            if frame_bgr is None:
+                self.send_error(400, "Invalid image data")
+                return
+
+            # Process on Raspberry Pi CPU
+            annotated_jpeg, telemetry = process_single_frame(frame_bgr, source_name="LAPTOP WEBCAM -> PI EDGE INFER")
+
+            # Update latest telemetry
+            with frame_lock:
+                global latest_telemetry
+                latest_telemetry = telemetry
+
+            # Send back annotated JPEG + telemetry in Base64
+            telemetry["image_b64"] = base64.b64encode(annotated_jpeg).decode("utf-8")
+            response_bytes = json.dumps(telemetry).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(response_bytes)))
+            self.end_headers()
+            self.wfile.write(response_bytes)
+        else:
+            self.send_error(404)
 
     def do_GET(self):
         if self.path == "/":
@@ -312,12 +360,16 @@ class StreamingHandler(BaseHTTPRequestHandler):
             border-radius: 8px;
             padding: 12px;
             border: 1px solid #2d3139;
+            text-align: center;
         }}
         .stream-img {{
             width: 100%;
+            max-width: 640px;
             height: auto;
             border-radius: 6px;
             display: block;
+            margin: 0 auto;
+            background: #000;
         }}
         .card {{
             background: #1a1c23;
@@ -370,6 +422,27 @@ class StreamingHandler(BaseHTTPRequestHandler):
             text-align: left;
         }}
         th {{ color: #8b949e; }}
+        .btn {{
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            margin-right: 10px;
+        }}
+        .btn-stop {{ background: #da3633; }}
+        .btn:hover {{ opacity: 0.9; }}
+        .cam-selector {{
+            background: #21262d;
+            color: white;
+            border: 1px solid #30363d;
+            padding: 8px 12px;
+            border-radius: 6px;
+            margin-bottom: 12px;
+        }}
     </style>
 </head>
 <body>
@@ -379,29 +452,50 @@ class StreamingHandler(BaseHTTPRequestHandler):
             <div style="color: #8b949e; font-size: 14px;">Extreme Edge TinyML Object Localization & Classification on Edge Devices (Paper: Su et al. 2024)</div>
         </div>
         <div style="text-align: right; font-size: 13px; color: #00ffaa;">
-            🟢 LIVE EDGE NODE CONNECTED
+            🟢 RASPBERRY PI COMPUTE NODE
+        </div>
+    </div>
+
+    <!-- Mode Selector Banner -->
+    <div class="card" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 18px;">
+        <div>
+            <strong>Camera Source:</strong>
+            <label style="margin-left: 15px; cursor: pointer;">
+                <input type="radio" name="cam_src" value="laptop" checked onchange="switchSource('laptop')"> 💻 Use Laptop's Camera (Webcam in Browser)
+            </label>
+            <label style="margin-left: 20px; cursor: pointer;">
+                <input type="radio" name="cam_src" value="pi" onchange="switchSource('pi')"> 🍓 Use Pi's Camera (Plugged into Pi)
+            </label>
+        </div>
+        <div id="laptop-controls">
+            <button id="btn-start-cam" class="btn" onclick="startLaptopCamera()">▶️ Start Laptop Camera</button>
+            <button id="btn-stop-cam" class="btn btn-stop" style="display: none;" onclick="stopLaptopCamera()">⏹️ Stop Camera</button>
         </div>
     </div>
 
     <div class="grid">
         <div class="stream-card">
-            <img class="stream-img" src="/stream.mjpg" alt="Live YOLIC Stream" />
+            <img id="stream-display" class="stream-img" src="" alt="Stream View" />
+            <video id="hidden-video" style="display: none;" playsinline></video>
+            <canvas id="hidden-canvas" style="display: none;" width="640" height="480"></canvas>
+            <div id="cam-status-msg" style="margin-top: 10px; color: #8b949e; font-size: 13px;">Click "Start Laptop Camera" to stream your laptop's camera directly to the Raspberry Pi for inference!</div>
         </div>
+
         <div>
-            <div id="actuator-banner" class="actuator-box clear">ACTUATOR: INITIALIZING...</div>
+            <div id="actuator-banner" class="actuator-box clear">ACTUATOR: ALL CLEAR (Cruising: 25 km/h)</div>
 
             <div class="card">
                 <div class="metric-row">
                     <div class="metric">
                         <div id="metric-fps" class="metric-val">--</div>
-                        <div class="metric-label">INFERENCE FPS</div>
+                        <div class="metric-label">PI INFERENCE FPS</div>
                     </div>
                     <div class="metric">
                         <div id="metric-lat" class="metric-val">-- ms</div>
-                        <div class="metric-label">LATENCY</div>
+                        <div class="metric-label">EDGE LATENCY</div>
                     </div>
                     <div class="metric">
-                        <div id="metric-speed" class="metric-val">-- km/h</div>
+                        <div id="metric-speed" class="metric-val">25 km/h</div>
                         <div class="metric-label">TARGET SPEED</div>
                     </div>
                 </div>
@@ -414,7 +508,7 @@ class StreamingHandler(BaseHTTPRequestHandler):
                         <tr><th>CoI #</th><th>Class</th><th>Confidence</th><th>Field</th></tr>
                     </thead>
                     <tbody id="hazard-tbody">
-                        <tr><td colspan="4" style="color: #8b949e;">No active hazards detected.</td></tr>
+                        <tr><td colspan="4" style="color: #06d6a0;">✅ Path Clear. Zero hazards detected.</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -422,43 +516,140 @@ class StreamingHandler(BaseHTTPRequestHandler):
     </div>
 
     <script>
-        async function updateTelemetry() {{
-            try {{
-                const res = await fetch('/api/telemetry');
-                const data = await res.json();
-                
-                document.getElementById('metric-fps').innerText = data.fps;
-                document.getElementById('metric-lat').innerText = data.latency_ms + ' ms';
-                document.getElementById('metric-speed').innerText = data.target_speed + ' km/h';
+        let currentSource = 'laptop';
+        let laptopStream = null;
+        let isStreamingLaptop = false;
+        let laptopInterval = null;
 
-                const banner = document.getElementById('actuator-banner');
-                banner.innerText = data.status;
-                if (data.target_speed === 0) {{
-                    banner.className = 'actuator-box brake';
-                }} else if (data.target_speed === 10) {{
-                    banner.className = 'actuator-box warning';
-                }} else {{
-                    banner.className = 'actuator-box clear';
-                }}
+        const imgDisplay = document.getElementById('stream-display');
+        const video = document.getElementById('hidden-video');
+        const canvas = document.getElementById('hidden-canvas');
+        const ctx = canvas.getContext('2d');
+        const statusMsg = document.getElementById('cam-status-msg');
 
-                const tbody = document.getElementById('hazard-tbody');
-                if (data.active_hazards && data.active_hazards.length > 0) {{
-                    tbody.innerHTML = data.active_hazards.map(h => `
-                        <tr>
-                            <td>#${{h.coi_id + 1}}</td>
-                            <td><strong>${{h.class}}</strong></td>
-                            <td>${{Math.round(h.conf * 100)}}%</td>
-                            <td>${{h.is_near ? '<span style="color: #ff6b6b;">Near (Brake)</span>' : '<span style="color: #ffd166;">Mid-Range</span>'}}</td>
-                        </tr>
-                    `).join('');
-                }} else {{
-                    tbody.innerHTML = '<tr><td colspan="4" style="color: #06d6a0;">✅ All clear. No obstacles in path.</td></tr>';
-                }}
-            }} catch (e) {{
-                console.error(e);
+        function switchSource(src) {{
+            currentSource = src;
+            if (src === 'pi') {{
+                stopLaptopCamera();
+                document.getElementById('laptop-controls').style.display = 'none';
+                imgDisplay.src = '/stream.mjpg';
+                statusMsg.innerText = 'Streaming from camera connected directly to Raspberry Pi...';
+            }} else {{
+                document.getElementById('laptop-controls').style.display = 'block';
+                imgDisplay.src = '';
+                statusMsg.innerText = 'Click "Start Laptop Camera" to begin streaming your laptop camera to the Pi.';
             }}
         }}
-        setInterval(updateTelemetry, 150);
+
+        async function startLaptopCamera() {{
+            try {{
+                statusMsg.innerText = 'Accessing laptop webcam...';
+                laptopStream = await navigator.mediaDevices.getUserMedia({{
+                    video: {{ width: 640, height: 480, facingMode: 'user' }}
+                }});
+                video.srcObject = laptopStream;
+                await video.play();
+
+                isStreamingLaptop = true;
+                document.getElementById('btn-start-cam').style.display = 'none';
+                document.getElementById('btn-stop-cam').style.display = 'inline-block';
+                statusMsg.innerText = '🟢 Streaming laptop webcam frames to Raspberry Pi for real-time edge inference...';
+
+                // Send frames to Raspberry Pi at ~20-25 FPS
+                sendFrameLoop();
+            }} catch (err) {{
+                alert('Could not access laptop camera: ' + err.message);
+                statusMsg.innerText = 'Error accessing camera: ' + err.message;
+            }}
+        }}
+
+        function stopLaptopCamera() {{
+            isStreamingLaptop = false;
+            if (laptopStream) {{
+                laptopStream.getTracks().forEach(track => track.stop());
+                laptopStream = null;
+            }}
+            document.getElementById('btn-start-cam').style.display = 'inline-block';
+            document.getElementById('btn-stop-cam').style.display = 'none';
+            statusMsg.innerText = 'Camera stopped.';
+        }}
+
+        async function sendFrameLoop() {{
+            if (!isStreamingLaptop) return;
+
+            // Draw current video frame to canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // Convert to JPEG blob
+            canvas.toBlob(async (blob) => {{
+                if (!blob || !isStreamingLaptop) return;
+
+                const t0 = performance.now();
+                try {{
+                    const response = await fetch('/api/infer_laptop_frame', {{
+                        method: 'POST',
+                        body: blob
+                    }});
+
+                    if (response.ok) {{
+                        const data = await response.json();
+                        // Render returned annotated frame from Raspberry Pi
+                        if (data.image_b64) {{
+                            imgDisplay.src = 'data:image/jpeg;base64,' + data.image_b64;
+                        }}
+                        updateUI(data);
+                    }}
+                }} catch (e) {{
+                    console.error(e);
+                }}
+
+                // Schedule next frame immediately after previous returns
+                if (isStreamingLaptop) {{
+                    setTimeout(sendFrameLoop, 15);
+                }}
+            }}, 'image/jpeg', 0.75);
+        }}
+
+        function updateUI(data) {{
+            document.getElementById('metric-fps').innerText = data.fps;
+            document.getElementById('metric-lat').innerText = data.latency_ms + ' ms';
+            document.getElementById('metric-speed').innerText = data.target_speed + ' km/h';
+
+            const banner = document.getElementById('actuator-banner');
+            banner.innerText = data.status;
+            if (data.target_speed === 0) {{
+                banner.className = 'actuator-box brake';
+            }} else if (data.target_speed === 10) {{
+                banner.className = 'actuator-box warning';
+            }} else {{
+                banner.className = 'actuator-box clear';
+            }}
+
+            const tbody = document.getElementById('hazard-tbody');
+            if (data.active_hazards && data.active_hazards.length > 0) {{
+                tbody.innerHTML = data.active_hazards.map(h => `
+                    <tr>
+                        <td>#${{h.coi_id + 1}}</td>
+                        <td><strong>${{h.class}}</strong></td>
+                        <td>${{Math.round(h.conf * 100)}}%</td>
+                        <td>${{h.is_near ? '<span style="color: #ff6b6b;">Near (Brake)</span>' : '<span style="color: #ffd166;">Mid-Range</span>'}}</td>
+                    </tr>
+                `).join('');
+            }} else {{
+                tbody.innerHTML = '<tr><td colspan="4" style="color: #06d6a0;">✅ All clear. Zero hazards detected.</td></tr>';
+            }}
+        }}
+
+        // If in Pi camera mode, poll telemetry
+        setInterval(async () => {{
+            if (currentSource === 'pi') {{
+                try {{
+                    const res = await fetch('/api/telemetry');
+                    const data = await res.json();
+                    updateUI(data);
+                }} catch (e) {{}}
+            }}
+        }}, 200);
     </script>
 </body>
 </html>
@@ -507,25 +698,27 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Raspberry Pi Edge YOLIC Server")
     parser.add_argument("--port", type=int, default=8080, help="HTTP Server Port (default: 8080)")
-    parser.add_argument("--camera", type=int, default=0, help="Camera device index (default: 0)")
+    parser.add_argument("--camera", type=int, default=0, help="Pi Camera device index if connected (default: 0)")
     args = parser.parse_args()
 
-    # Start inference in background thread
-    worker_thread = Thread(target=edge_inference_worker, args=(args.camera,), daemon=True)
-    worker_thread.start()
+    # 1. Initialize YOLIC Pipeline on Raspberry Pi
+    init_yolic_pipeline()
+
+    # 2. Start Pi camera thread (if Pi camera is plugged in)
+    pi_cam_thread = Thread(target=pi_camera_worker, args=(args.camera,), daemon=True)
+    pi_cam_thread.start()
 
     local_ip = get_local_ip()
     server_address = ("0.0.0.0", args.port)
     httpd = HTTPServer(server_address, StreamingHandler)
 
-    print("\n" + "=" * 65)
+    print("\n" + "=" * 70)
     print("🚀 RASPBERRY PI YOLIC EDGE SERVER RUNNING")
-    print("=" * 65)
-    print(f"📡 Local Pi Address:   http://localhost:{args.port}")
+    print("=" * 70)
+    print(f"📡 Pi Local Address:   http://localhost:{args.port}")
     print(f"💻 Open on your Laptop: http://{local_ip}:{args.port}")
-    print(f"📹 Video Stream URL:   http://{local_ip}:{args.port}/stream.mjpg")
-    print(f"📊 Telemetry API:      http://{local_ip}:{args.port}/api/telemetry")
-    print("=" * 65)
+    print("   👉 Click 'Start Laptop Camera' on your laptop to use your laptop webcam!")
+    print("=" * 70)
     print("Press Ctrl+C to stop the server.\n")
 
     try:

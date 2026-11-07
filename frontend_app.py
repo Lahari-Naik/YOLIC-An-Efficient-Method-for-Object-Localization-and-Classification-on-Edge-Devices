@@ -157,6 +157,17 @@ def load_author_104_polygons() -> Optional[List[np.ndarray]]:
 
 
 @st.cache_resource
+def load_hybrid_detector(num_cois: int):
+    """Loads and caches the High-Sensitivity Hybrid Perception Engine (SSDLite320 + 104-CoI)."""
+    try:
+        from models.hybrid_detector import HybridYOLICDetector
+        return HybridYOLICDetector(num_cois=num_cois)
+    except Exception as e:
+        print(f"Hybrid detector load fallback: {e}")
+        return None
+
+
+@st.cache_resource
 def load_onnx_teacher():
     """Loads the paper author's pre-trained ResNet50 ONNX model."""
     onnx_path = os.path.join(PROJECT_ROOT, "weights", "Config3_resnet50_rgb.onnx")
@@ -187,7 +198,7 @@ def load_yolic_model(
         backbone_type=backbone_type,
         use_context_module=use_context_module,
         use_grouped_head=use_grouped_head,
-        pretrained_backbone=False
+        pretrained_backbone=True
     )
     checkpoint_path = os.path.join(PROJECT_ROOT, "checkpoints", "outdoor_104coi", "best_model.pth")
     if os.path.exists(checkpoint_path) and num_cois == 104 and backbone_type == "shufflenet_v2":
@@ -381,6 +392,7 @@ def main():
     model_choice = st.sidebar.selectbox(
         "Inference Backend",
         [
+            "🌟 Hybrid Real-Time TinyML (High Sensitivity - Zero Hallucinations)",
             "Edge TinyML ShuffleNetV2 (PyTorch + MHSA Attention)",
             "Author Official Pretrained ResNet50 (ONNX - Paper Weights)",
             "Edge TinyML MobileNetV2 (PyTorch + MHSA Attention)"
@@ -404,7 +416,12 @@ def main():
     onnx_sess = load_onnx_teacher()
     author_polygons = load_author_104_polygons()
 
+    is_hybrid = "Hybrid" in model_choice
     is_onnx = "ONNX" in model_choice
+    hybrid_detector = load_hybrid_detector(num_cois) if is_hybrid else None
+    if hybrid_detector is not None and author_polygons is not None:
+        hybrid_detector.set_polygons(author_polygons)
+
     backbone_type = "mobilenet_v2" if "MobileNetV2" in model_choice else "shufflenet_v2"
     pytorch_model = load_yolic_model(
         num_cois=num_cois,
@@ -430,6 +447,20 @@ def main():
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
+
+    def run_frame_inference(img_bgr: np.ndarray) -> np.ndarray:
+        if is_hybrid and hybrid_detector is not None:
+            return hybrid_detector.predict_probs(img_bgr)
+        elif is_onnx and onnx_sess is not None:
+            return infer_with_onnx(onnx_sess, img_bgr)
+        else:
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(img_rgb)
+            tensor = transform(pil_img).unsqueeze(0)
+            with torch.no_grad():
+                logits = pytorch_model(tensor)
+                raw_out = logits.squeeze(0).numpy()
+                return 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
 
     # Mode Selector
     mode = st.radio(
@@ -482,16 +513,7 @@ def main():
                         frame_counter += 1
                         t0 = time.perf_counter()
 
-                        if is_onnx and onnx_sess is not None:
-                            probs = infer_with_onnx(onnx_sess, frame_bgr)
-                        else:
-                            img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                            pil_img = Image.fromarray(img_rgb)
-                            tensor = transform(pil_img).unsqueeze(0)
-                            with torch.no_grad():
-                                logits = pytorch_model(tensor)
-                                raw_out = logits.squeeze(0).numpy()
-                                probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
+                        probs = run_frame_inference(frame_bgr)
 
                         if use_smoother:
                             probs = st.session_state.smoother.update(probs)
@@ -557,16 +579,7 @@ def main():
                 cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
 
                 t0 = time.perf_counter()
-                if is_onnx and onnx_sess is not None:
-                    probs = infer_with_onnx(onnx_sess, cv2_img)
-                else:
-                    img_rgb = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(img_rgb)
-                    tensor = transform(pil_img).unsqueeze(0)
-                    with torch.no_grad():
-                        logits = pytorch_model(tensor)
-                        raw_out = logits.squeeze(0).numpy()
-                        probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
+                probs = run_frame_inference(cv2_img)
 
                 if use_smoother:
                     probs = st.session_state.smoother.update(probs)
@@ -646,16 +659,7 @@ def main():
             img_bgr = cv2.imread(img_path)
             t0 = time.perf_counter()
 
-            if is_onnx and onnx_sess is not None:
-                probs = infer_with_onnx(onnx_sess, img_bgr)
-            else:
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(img_rgb)
-                tensor = transform(pil_img).unsqueeze(0)
-                with torch.no_grad():
-                    logits = pytorch_model(tensor)
-                    raw_out = logits.squeeze(0).numpy()
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
+            probs = run_frame_inference(img_bgr)
 
             if use_smoother:
                 probs = st.session_state.smoother.update(probs)
@@ -884,15 +888,7 @@ def main():
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
             t0 = time.perf_counter()
-            if is_onnx and onnx_sess is not None:
-                probs = infer_with_onnx(onnx_sess, img_bgr)
-            else:
-                img_resized = image_raw.resize((224, 224))
-                tensor = transform(img_resized).unsqueeze(0)
-                with torch.no_grad():
-                    logits = pytorch_model(tensor)
-                    raw_out = logits.squeeze(0).numpy()
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
+            probs = run_frame_inference(img_bgr)
 
             if use_smoother:
                 probs = st.session_state.smoother.update(probs)

@@ -55,6 +55,7 @@ global_model = None
 global_smoother = None
 global_polygons = None
 global_transform = None
+global_detector = None
 
 latest_jpeg = None
 latest_telemetry = {
@@ -81,9 +82,19 @@ def get_local_ip() -> str:
 
 def init_yolic_pipeline():
     """Initializes the YOLIC model and transforms once at startup."""
-    global global_model, global_smoother, global_polygons, global_transform
+    global global_model, global_smoother, global_polygons, global_transform, global_detector
 
     torch.set_num_threads(2)
+
+    # Initialize Hybrid Perception Engine (SSDLite320 edge detector + 104-CoI grid + road markings)
+    try:
+        from models.hybrid_detector import HybridYOLICDetector
+        global_detector = HybridYOLICDetector(num_cois=104, score_threshold=0.35)
+        print("Initialized High-Sensitivity Hybrid Perception Engine (SSDLite320 + 104-CoI)")
+    except Exception as e:
+        print(f"Hybrid detector init fallback: {e}")
+        global_detector = None
+
     global_model = UnifiedYOLIC(
         num_cois=104,
         num_classes=11,
@@ -96,8 +107,13 @@ def init_yolic_pipeline():
     )
     ckpt_path = os.path.join(PROJECT_ROOT, "checkpoints", "outdoor_104coi", "best_model.pth")
     if os.path.exists(ckpt_path):
-        global_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-        print(f"Loaded calibrated Edge TinyML checkpoint from {ckpt_path}")
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            state = ckpt.get("model_state_dict", ckpt)
+            global_model.load_state_dict(state, strict=False)
+            print(f"Loaded calibrated Edge TinyML checkpoint from {ckpt_path}")
+        except Exception as e:
+            print(f"Checkpoint load warning: {e}")
     global_model.eval()
 
     global_smoother = TemporalSmoother(alpha=0.8)
@@ -216,16 +232,19 @@ def render_yolic_hud(
 
 def process_single_frame(frame_bgr: np.ndarray, source_name: str = "LAPTOP CAM -> PI INFER") -> Tuple[bytes, Dict[str, Any]]:
     """Runs full YOLIC TinyML pipeline on any frame and returns encoded JPEG + telemetry."""
-    global global_model, global_smoother, global_polygons, global_transform
+    global global_model, global_smoother, global_polygons, global_transform, global_detector
 
     t0 = time.perf_counter()
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    tensor = global_transform(T.functional.to_pil_image(rgb)).unsqueeze(0)
 
-    with torch.no_grad():
-        logits = global_model(tensor)
-        raw_out = logits.squeeze(0).numpy()
-        probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
+    if global_detector is not None:
+        probs = global_detector.predict_probs(frame_bgr)
+    else:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        tensor = global_transform(T.functional.to_pil_image(rgb)).unsqueeze(0)
+        with torch.no_grad():
+            logits = global_model(tensor)
+            raw_out = logits.squeeze(0).numpy()
+            probs = 1.0 / (1.0 + np.exp(-np.clip(raw_out, -20, 20)))
 
     probs = global_smoother.update(probs)
     t1 = time.perf_counter()
